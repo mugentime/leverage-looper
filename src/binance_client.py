@@ -196,6 +196,20 @@ class BinanceClient:
             logger.error(f"Failed to get spot balance for {asset}: {e}")
             return 0.0
 
+    async def get_all_spot_balances(self) -> Dict[str, float]:
+        """Get all non-zero spot balances"""
+        try:
+            account = await self.client.get_account()
+            balances = {}
+            for balance in account.get("balances", []):
+                free = float(balance["free"])
+                if free > 0:
+                    balances[balance["asset"]] = free
+            return balances
+        except Exception as e:
+            logger.error(f"Failed to get spot balances: {e}")
+            return {}
+
     async def market_buy(self, symbol: str, quote_qty: float) -> Dict:
         """Market buy with quote quantity (e.g., buy SOL with 100 USDT)"""
         try:

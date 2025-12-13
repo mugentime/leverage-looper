@@ -3,17 +3,18 @@ Leverage Looper - Maximizes leverage on existing loan positions through recursiv
 
 Strategy:
 - For each position: borrow at 75% LTV -> convert to collateral -> add collateral -> repeat
-- Target: 4x leverage (theoretical max at 75% LTV = 1/(1-0.75) = 4x)
-- Stop when: leverage >= 3.9x OR loop amount < $1
+- Target: MAXIMUM leverage (no cap)
+- Stop when: borrow amount < $1 OR spot reserve reaches $10
+- After looping: sweep remaining spot balances into collateral
 """
 import asyncio
 from typing import Dict, List, Optional
 from loguru import logger
 
 TARGET_LTV = 0.75
-MAX_LEVERAGE = 3.9  # Stop at 3.9x for safety buffer (theoretical max is 4x)
-MIN_LOOP_USD = 1.0  # Minimum $1 per loop to avoid dust
-API_DELAY = 1.5     # Seconds between API calls
+MIN_LOOP_USD = 1.0      # Minimum $1 per loop to avoid dust
+MIN_RESERVE_USD = 10.0  # Keep $10 minimum in spot
+API_DELAY = 1.5         # Seconds between API calls
 
 
 class LeverageLooper:
@@ -31,6 +32,20 @@ class LeverageLooper:
         except Exception as e:
             logger.warning(f"Could not get price for {coin}: {e}")
             return 0.0
+
+    async def get_total_spot_value(self) -> float:
+        """Get total USD value of all spot balances"""
+        balances = await self.client.get_all_spot_balances()
+        total = 0.0
+        for asset, amount in balances.items():
+            if asset.startswith('LD'):  # Skip Simple Earn tokens
+                continue
+            if asset == 'USDT':
+                total += amount
+            else:
+                price = await self._get_price(asset)
+                total += amount * price
+        return total
 
     async def get_current_leverage(self, loan: Dict) -> float:
         """
@@ -70,7 +85,6 @@ class LeverageLooper:
         loan_coin = loan.get('loanCoin')
         coll_amount = float(loan.get('collateralAmount', 0))
         total_debt = float(loan.get('totalDebt', 0))
-        current_ltv = float(loan.get('currentLTV', 0))
 
         coll_price = await self._get_price(coll_coin)
         loan_price = await self._get_price(loan_coin)
@@ -134,14 +148,10 @@ class LeverageLooper:
         await asyncio.sleep(API_DELAY)
 
         # Step 2: Convert borrowed funds to collateral asset
-        # Skip if collateral is same as loan (e.g., USDT collateral)
         if coll_coin == loan_coin:
-            # No conversion needed, just add the borrowed amount as collateral
             add_amount = borrow_amount
         else:
-            # Convert loan coin to collateral coin
             try:
-                # Get current spot balance of loan coin
                 loan_balance = await self.client.get_spot_balance(loan_coin)
                 convert_amount = min(borrow_amount, loan_balance * 0.99)
 
@@ -149,34 +159,25 @@ class LeverageLooper:
                     result['error'] = f'Insufficient {loan_coin} balance to convert'
                     return result
 
-                # Use Convert API for small amounts, market order for larger
                 convert_usd = convert_amount * await self._get_price(loan_coin)
 
                 if convert_usd >= 5.0:
-                    # Market sell loan_coin for collateral coin
                     logger.info(f"  Loop: Selling {convert_amount:.4f} {loan_coin} for {coll_coin}")
                     try:
-                        # Sell loan_coin -> USDT first if collateral isn't USDT
                         if loan_coin != 'USDT' and coll_coin != 'USDT':
-                            # Sell loan_coin -> USDT
                             sell_result = await self.client.market_sell(f'{loan_coin}USDT', convert_amount)
                             usdt_received = float(sell_result.get('cummulativeQuoteQty', 0))
                             await asyncio.sleep(API_DELAY)
-
-                            # Buy coll_coin with USDT
                             buy_result = await self.client.market_buy(f'{coll_coin}USDT', usdt_received)
                             add_amount = float(buy_result.get('executedQty', 0))
                         elif loan_coin == 'USDT':
-                            # Buy coll_coin with USDT directly
                             buy_result = await self.client.market_buy(f'{coll_coin}USDT', convert_amount)
                             add_amount = float(buy_result.get('executedQty', 0))
                         else:
-                            # loan_coin != USDT, coll_coin == USDT
                             sell_result = await self.client.market_sell(f'{loan_coin}USDT', convert_amount)
                             add_amount = float(sell_result.get('cummulativeQuoteQty', 0))
                     except Exception as e:
                         logger.warning(f"  Market trade failed, trying Convert API: {e}")
-                        # Fallback to Convert API
                         convert_result = await self.client.convert_asset(loan_coin, coll_coin, convert_amount)
                         if convert_result.get('status') == 'SUCCESS':
                             add_amount = float(convert_result.get('toAmount', 0))
@@ -184,7 +185,6 @@ class LeverageLooper:
                             result['error'] = f'Convert failed: {convert_result}'
                             return result
                 else:
-                    # Use Convert API for small amounts
                     logger.info(f"  Loop: Converting {convert_amount:.4f} {loan_coin} to {coll_coin}")
                     convert_result = await self.client.convert_asset(loan_coin, coll_coin, convert_amount)
                     if convert_result.get('status') == 'SUCCESS':
@@ -226,19 +226,88 @@ class LeverageLooper:
 
         return result
 
+    async def sweep_spot_to_collateral(self, loans: List[Dict]) -> Dict:
+        """
+        Sweep remaining spot balances into their respective collateral positions.
+        Keep $10 reserve in USDT.
+
+        Returns: {swept_usd: float, positions_swept: int, details: List}
+        """
+        result = {
+            'swept_usd': 0.0,
+            'positions_swept': 0,
+            'details': []
+        }
+
+        # Build map of collateral coins to their positions
+        coll_to_position = {}
+        for loan in loans:
+            coll_coin = loan.get('collateralCoin')
+            if coll_coin not in coll_to_position:
+                coll_to_position[coll_coin] = loan
+
+        # Get all spot balances
+        balances = await self.client.get_all_spot_balances()
+
+        # Calculate how much USDT to keep as reserve
+        usdt_balance = balances.get('USDT', 0)
+
+        for asset, amount in balances.items():
+            if asset.startswith('LD'):  # Skip Simple Earn tokens
+                continue
+
+            # Skip if no matching position
+            if asset not in coll_to_position:
+                continue
+
+            price = await self._get_price(asset)
+            usd_value = amount * price
+
+            # For USDT, keep $10 reserve
+            if asset == 'USDT':
+                available = max(0, amount - MIN_RESERVE_USD)
+                if available < 1:
+                    continue
+                add_amount = available
+                usd_value = available
+            else:
+                # For other assets, use all if > $0.50
+                if usd_value < 0.50:
+                    continue
+                add_amount = amount * 0.99  # Leave tiny buffer
+
+            loan = coll_to_position[asset]
+            loan_coin = loan.get('loanCoin')
+
+            logger.info(f"Sweep: Adding {add_amount:.6f} {asset} (${usd_value:.2f}) to {asset}->{loan_coin}")
+
+            try:
+                await self.client.adjust_loan_ltv(
+                    loan_coin=loan_coin,
+                    collateral_coin=asset,
+                    adjustment_amount=add_amount,
+                    direction='ADDITIONAL'
+                )
+                result['swept_usd'] += usd_value
+                result['positions_swept'] += 1
+                result['details'].append({
+                    'asset': asset,
+                    'amount': add_amount,
+                    'usd': usd_value,
+                    'position': f"{asset}->{loan_coin}"
+                })
+                logger.info(f"  Swept {add_amount:.6f} {asset} successfully")
+            except Exception as e:
+                logger.warning(f"  Sweep failed for {asset}: {e}")
+
+            await asyncio.sleep(API_DELAY)
+
+        return result
+
     async def loop_position(self, loan: Dict) -> Dict:
         """
-        Run loops on a single position until 4x leverage or min amount reached
-
-        Returns: {
-            position: str,
-            initial_leverage: float,
-            final_leverage: float,
-            loops_executed: int,
-            total_borrowed_usd: float,
-            total_added_usd: float,
-            errors: List[str]
-        }
+        Run loops on a single position until borrow amount < $1
+        NO LEVERAGE CAP - maximize everything
         """
         coll_coin = loan.get('collateralCoin')
         loan_coin = loan.get('loanCoin')
@@ -256,14 +325,9 @@ class LeverageLooper:
             'errors': []
         }
 
-        if initial_leverage >= MAX_LEVERAGE:
-            logger.info(f"{position_name}: Already at {initial_leverage:.2f}x leverage")
-            return result
+        logger.info(f"{position_name}: Starting at {initial_leverage:.2f}x leverage")
 
-        logger.info(f"{position_name}: Starting at {initial_leverage:.2f}x, target {MAX_LEVERAGE}x")
-
-        # Get fresh loan data for each loop iteration
-        max_loops = 20  # Safety limit
+        max_loops = 50  # Safety limit
         loop_count = 0
 
         while loop_count < max_loops:
@@ -283,20 +347,15 @@ class LeverageLooper:
 
             current_leverage = await self.get_current_leverage(current_loan)
 
-            if current_leverage >= MAX_LEVERAGE:
-                logger.info(f"  Reached {current_leverage:.2f}x leverage - target achieved!")
-                result['final_leverage'] = current_leverage
-                break
-
             # Check if borrow amount is sufficient
             _, borrow_usd = await self.calculate_borrow_amount(current_loan)
             if borrow_usd < MIN_LOOP_USD:
-                logger.info(f"  Borrow amount ${borrow_usd:.2f} too small - stopping")
+                logger.info(f"  Borrow amount ${borrow_usd:.2f} too small - position maxed out at {current_leverage:.2f}x")
                 result['final_leverage'] = current_leverage
                 break
 
             # Execute loop
-            logger.info(f"  Loop {loop_count}: leverage {current_leverage:.2f}x")
+            logger.info(f"  Loop {loop_count}: leverage {current_leverage:.2f}x, can borrow ${borrow_usd:.2f}")
             loop_result = await self.execute_loop(current_loan)
 
             if loop_result['success']:
@@ -322,16 +381,9 @@ class LeverageLooper:
 
     async def loop_all_positions(self) -> Dict:
         """
-        Loop all active positions to maximize leverage
-
-        Returns: {
-            positions_processed: int,
-            positions_looped: int,
-            total_loops: int,
-            total_borrowed_usd: float,
-            total_added_usd: float,
-            details: List[Dict]
-        }
+        Loop all active positions to MAXIMIZE leverage (no cap)
+        Then sweep remaining spot balances into collateral
+        Keep only $10 reserve
         """
         loans = await self.client.get_flexible_loan_ongoing_orders()
 
@@ -343,10 +395,13 @@ class LeverageLooper:
                 'total_loops': 0,
                 'total_borrowed_usd': 0.0,
                 'total_added_usd': 0.0,
+                'swept_usd': 0.0,
                 'details': []
             }
 
-        logger.info(f"=== LEVERAGE LOOP: {len(loans)} positions ===")
+        # Check spot balance first
+        spot_value = await self.get_total_spot_value()
+        logger.info(f"=== LEVERAGE LOOP: {len(loans)} positions, ${spot_value:.2f} in spot ===")
 
         result = {
             'positions_processed': len(loans),
@@ -354,10 +409,11 @@ class LeverageLooper:
             'total_loops': 0,
             'total_borrowed_usd': 0.0,
             'total_added_usd': 0.0,
+            'swept_usd': 0.0,
             'details': []
         }
 
-        # Sort by leverage ascending (lowest leverage first - most opportunity)
+        # Sort by leverage ascending (lowest leverage first)
         sorted_loans = []
         for loan in loans:
             leverage = await self.get_current_leverage(loan)
@@ -365,11 +421,8 @@ class LeverageLooper:
 
         sorted_loans.sort(key=lambda x: x[0])
 
+        # Loop each position to max
         for leverage, loan in sorted_loans:
-            if leverage >= MAX_LEVERAGE:
-                logger.info(f"{loan.get('collateralCoin')}->{loan.get('loanCoin')}: Already at {leverage:.2f}x - skip")
-                continue
-
             loop_result = await self.loop_position(loan)
             result['details'].append(loop_result)
 
@@ -381,10 +434,21 @@ class LeverageLooper:
 
             await asyncio.sleep(API_DELAY)
 
+        # SWEEP: Add remaining spot balances to collateral (keep $10 reserve)
+        logger.info("=== SWEEPING SPOT BALANCES ===")
+        loans = await self.client.get_flexible_loan_ongoing_orders()  # Refresh
+        sweep_result = await self.sweep_spot_to_collateral(loans)
+        result['swept_usd'] = sweep_result['swept_usd']
+
+        # Final spot check
+        final_spot = await self.get_total_spot_value()
+
         logger.info(f"=== LEVERAGE LOOP COMPLETE ===")
         logger.info(f"  Positions looped: {result['positions_looped']}/{result['positions_processed']}")
         logger.info(f"  Total loops: {result['total_loops']}")
         logger.info(f"  Total borrowed: ${result['total_borrowed_usd']:.2f}")
         logger.info(f"  Total added: ${result['total_added_usd']:.2f}")
+        logger.info(f"  Swept from spot: ${result['swept_usd']:.2f}")
+        logger.info(f"  Remaining spot: ${final_spot:.2f}")
 
         return result
