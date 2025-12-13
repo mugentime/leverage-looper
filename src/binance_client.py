@@ -303,6 +303,26 @@ class BinanceClient:
             logger.error(f"Convert {from_asset} to {to_asset} failed: {e}")
             return {'code': -1, 'msg': str(e)}
 
+    # ==================== SIMPLE EARN METHODS ====================
+
+    async def get_simple_earn_flexible_positions(self) -> List[Dict]:
+        """Get all Simple Earn flexible positions"""
+        params = {'size': 100}
+        result = await self._request('GET', '/sapi/v1/simple-earn/flexible/position', params)
+        return result.get('rows', [])
+
+    async def redeem_simple_earn_flexible(self, product_id: str, amount: float = None, redeem_all: bool = True) -> Dict:
+        """Redeem from Simple Earn flexible product"""
+        params = {
+            'productId': product_id,
+            'redeemAll': str(redeem_all).lower()
+        }
+        if amount and not redeem_all:
+            params['amount'] = f"{amount:.8f}".rstrip('0').rstrip('.')
+        result = await self._request('POST', '/sapi/v1/simple-earn/flexible/redeem', params)
+        logger.info(f"Redeemed Simple Earn product {product_id}")
+        return result
+
     # ==================== PRICE DATA (via python-binance) ====================
 
     async def get_price(self, symbol: str) -> float:

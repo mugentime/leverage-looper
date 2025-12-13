@@ -13,7 +13,7 @@ from loguru import logger
 
 TARGET_LTV = 0.75
 MIN_LOOP_USD = 1.0      # Minimum $1 per loop to avoid dust
-MIN_RESERVE_USD = 10.0  # Keep $10 minimum in spot
+MIN_RESERVE_USD = 0.50  # Keep only $0.50 for fees
 API_DELAY = 1.5         # Seconds between API calls
 
 
@@ -226,10 +226,114 @@ class LeverageLooper:
 
         return result
 
+    async def redeem_all_simple_earn(self) -> Dict:
+        """
+        Redeem ALL Simple Earn flexible positions to spot.
+        Returns: {redeemed_usd: float, positions_redeemed: int}
+        """
+        result = {'redeemed_usd': 0.0, 'positions_redeemed': 0}
+
+        try:
+            positions = await self.client.get_simple_earn_flexible_positions()
+
+            for pos in positions:
+                asset = pos.get('asset', '')
+                amount = float(pos.get('totalAmount', 0))
+                product_id = pos.get('productId', '')
+
+                if amount < 0.0001 or not product_id:
+                    continue
+
+                price = await self._get_price(asset)
+                usd_value = amount * price
+
+                logger.info(f"Redeeming Simple Earn: {amount:.6f} {asset} (${usd_value:.2f})")
+
+                try:
+                    await self.client.redeem_simple_earn_flexible(product_id, redeem_all=True)
+                    result['redeemed_usd'] += usd_value
+                    result['positions_redeemed'] += 1
+                    logger.info(f"  Redeemed {asset} successfully")
+                except Exception as e:
+                    logger.warning(f"  Redeem failed for {asset}: {e}")
+
+                await asyncio.sleep(API_DELAY)
+
+        except Exception as e:
+            logger.error(f"Failed to get Simple Earn positions: {e}")
+
+        return result
+
+    async def sell_orphan_assets_to_usdt(self, loans: List[Dict]) -> Dict:
+        """
+        Sell assets that don't have matching loan positions to USDT.
+        Returns: {sold_usd: float, assets_sold: int}
+        """
+        result = {'sold_usd': 0.0, 'assets_sold': 0}
+
+        # Build set of collateral coins that have loan positions
+        coll_coins = set()
+        for loan in loans:
+            coll_coins.add(loan.get('collateralCoin'))
+
+        # Get all spot balances
+        balances = await self.client.get_all_spot_balances()
+
+        for asset, amount in balances.items():
+            # Skip USDT, LD tokens, and assets that have matching positions
+            if asset == 'USDT' or asset.startswith('LD') or asset in coll_coins:
+                continue
+
+            price = await self._get_price(asset)
+            if price == 0:
+                # Try to sell anyway via convert
+                pass
+
+            usd_value = amount * price if price > 0 else 0
+
+            if usd_value < 0.10 and price > 0:
+                continue
+
+            logger.info(f"Selling orphan asset: {amount:.6f} {asset} (${usd_value:.2f}) to USDT")
+
+            try:
+                # Try market sell first (better rate)
+                if usd_value >= 5.0:
+                    try:
+                        sell_result = await self.client.market_sell(f'{asset}USDT', amount * 0.99)
+                        sold_usdt = float(sell_result.get('cummulativeQuoteQty', 0))
+                        result['sold_usd'] += sold_usdt
+                        result['assets_sold'] += 1
+                        logger.info(f"  Sold {asset} for ${sold_usdt:.2f} USDT via market")
+                    except Exception as e:
+                        logger.warning(f"  Market sell failed, trying Convert: {e}")
+                        convert_result = await self.client.convert_asset(asset, 'USDT', amount * 0.99)
+                        if convert_result.get('status') == 'SUCCESS':
+                            sold_usdt = float(convert_result.get('toAmount', 0))
+                            result['sold_usd'] += sold_usdt
+                            result['assets_sold'] += 1
+                            logger.info(f"  Converted {asset} to ${sold_usdt:.2f} USDT")
+                else:
+                    # Use Convert API for small amounts
+                    convert_result = await self.client.convert_asset(asset, 'USDT', amount * 0.99)
+                    if convert_result.get('status') == 'SUCCESS':
+                        sold_usdt = float(convert_result.get('toAmount', 0))
+                        result['sold_usd'] += sold_usdt
+                        result['assets_sold'] += 1
+                        logger.info(f"  Converted {asset} to ${sold_usdt:.2f} USDT")
+                    else:
+                        logger.warning(f"  Convert failed for {asset}: {convert_result}")
+            except Exception as e:
+                logger.warning(f"  Failed to sell {asset}: {e}")
+
+            await asyncio.sleep(API_DELAY)
+
+        return result
+
     async def sweep_spot_to_collateral(self, loans: List[Dict]) -> Dict:
         """
         Sweep ALL remaining spot balances into collateral positions.
-        Keep only $10 USDT reserve. Distribute USDT across ALL USDT-collateral positions.
+        Keep only $0.50 USDT reserve. Distribute USDT across ALL USDT-collateral positions.
 
         Returns: {swept_usd: float, positions_swept: int, details: List}
         """
@@ -412,8 +516,10 @@ class LeverageLooper:
     async def loop_all_positions(self) -> Dict:
         """
         Loop all active positions to MAXIMIZE leverage (no cap)
-        Then sweep remaining spot balances into collateral
-        Keep only $10 reserve
+        1. Redeem ALL Simple Earn positions
+        2. Sell orphan assets (no matching position) to USDT
+        3. Sweep ALL spot balances into collateral
+        Keep only $0.50 reserve for fees
         """
         loans = await self.client.get_flexible_loan_ongoing_orders()
 
@@ -425,6 +531,8 @@ class LeverageLooper:
                 'total_loops': 0,
                 'total_borrowed_usd': 0.0,
                 'total_added_usd': 0.0,
+                'redeemed_usd': 0.0,
+                'sold_usd': 0.0,
                 'swept_usd': 0.0,
                 'details': []
             }
@@ -439,9 +547,27 @@ class LeverageLooper:
             'total_loops': 0,
             'total_borrowed_usd': 0.0,
             'total_added_usd': 0.0,
+            'redeemed_usd': 0.0,
+            'sold_usd': 0.0,
             'swept_usd': 0.0,
             'details': []
         }
+
+        # STEP 1: Redeem ALL Simple Earn positions
+        logger.info("=== REDEEMING SIMPLE EARN ===")
+        redeem_result = await self.redeem_all_simple_earn()
+        result['redeemed_usd'] = redeem_result['redeemed_usd']
+        if redeem_result['positions_redeemed'] > 0:
+            logger.info(f"  Redeemed {redeem_result['positions_redeemed']} positions (${redeem_result['redeemed_usd']:.2f})")
+            await asyncio.sleep(API_DELAY * 2)  # Wait for funds to settle
+
+        # STEP 2: Sell orphan assets to USDT
+        logger.info("=== SELLING ORPHAN ASSETS ===")
+        loans = await self.client.get_flexible_loan_ongoing_orders()  # Refresh
+        sell_result = await self.sell_orphan_assets_to_usdt(loans)
+        result['sold_usd'] = sell_result['sold_usd']
+        if sell_result['assets_sold'] > 0:
+            logger.info(f"  Sold {sell_result['assets_sold']} orphan assets (${sell_result['sold_usd']:.2f})")
 
         # Sort by leverage ascending (lowest leverage first)
         sorted_loans = []
@@ -464,8 +590,8 @@ class LeverageLooper:
 
             await asyncio.sleep(API_DELAY)
 
-        # SWEEP: Add remaining spot balances to collateral (keep $10 reserve)
-        logger.info("=== SWEEPING SPOT BALANCES ===")
+        # STEP 3: SWEEP ALL spot balances to collateral (keep only $0.50)
+        logger.info("=== SWEEPING ALL SPOT BALANCES ===")
         loans = await self.client.get_flexible_loan_ongoing_orders()  # Refresh
         sweep_result = await self.sweep_spot_to_collateral(loans)
         result['swept_usd'] = sweep_result['swept_usd']
@@ -478,6 +604,8 @@ class LeverageLooper:
         logger.info(f"  Total loops: {result['total_loops']}")
         logger.info(f"  Total borrowed: ${result['total_borrowed_usd']:.2f}")
         logger.info(f"  Total added: ${result['total_added_usd']:.2f}")
+        logger.info(f"  Redeemed from Earn: ${result['redeemed_usd']:.2f}")
+        logger.info(f"  Sold orphans: ${result['sold_usd']:.2f}")
         logger.info(f"  Swept from spot: ${result['swept_usd']:.2f}")
         logger.info(f"  Remaining spot: ${final_spot:.2f}")
 
