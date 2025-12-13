@@ -228,8 +228,8 @@ class LeverageLooper:
 
     async def sweep_spot_to_collateral(self, loans: List[Dict]) -> Dict:
         """
-        Sweep remaining spot balances into their respective collateral positions.
-        Keep $10 reserve in USDT.
+        Sweep ALL remaining spot balances into collateral positions.
+        Keep only $10 USDT reserve. Distribute USDT across ALL USDT-collateral positions.
 
         Returns: {swept_usd: float, positions_swept: int, details: List}
         """
@@ -239,44 +239,33 @@ class LeverageLooper:
             'details': []
         }
 
-        # Build map of collateral coins to their positions
-        coll_to_position = {}
+        # Build map of collateral coins to their positions (can have multiple per coin)
+        coll_to_positions = {}
         for loan in loans:
             coll_coin = loan.get('collateralCoin')
-            if coll_coin not in coll_to_position:
-                coll_to_position[coll_coin] = loan
+            if coll_coin not in coll_to_positions:
+                coll_to_positions[coll_coin] = []
+            coll_to_positions[coll_coin].append(loan)
 
         # Get all spot balances
         balances = await self.client.get_all_spot_balances()
 
-        # Calculate how much USDT to keep as reserve
-        usdt_balance = balances.get('USDT', 0)
-
+        # Process non-USDT assets first
         for asset, amount in balances.items():
-            if asset.startswith('LD'):  # Skip Simple Earn tokens
+            if asset.startswith('LD') or asset == 'USDT':
                 continue
 
-            # Skip if no matching position
-            if asset not in coll_to_position:
+            if asset not in coll_to_positions:
                 continue
 
             price = await self._get_price(asset)
             usd_value = amount * price
 
-            # For USDT, keep $10 reserve
-            if asset == 'USDT':
-                available = max(0, amount - MIN_RESERVE_USD)
-                if available < 1:
-                    continue
-                add_amount = available
-                usd_value = available
-            else:
-                # For other assets, use all if > $0.50
-                if usd_value < 0.50:
-                    continue
-                add_amount = amount * 0.99  # Leave tiny buffer
+            if usd_value < 0.10:  # Skip tiny amounts
+                continue
 
-            loan = coll_to_position[asset]
+            add_amount = amount * 0.99
+            loan = coll_to_positions[asset][0]  # Use first position for this collateral
             loan_coin = loan.get('loanCoin')
 
             logger.info(f"Sweep: Adding {add_amount:.6f} {asset} (${usd_value:.2f}) to {asset}->{loan_coin}")
@@ -301,6 +290,47 @@ class LeverageLooper:
                 logger.warning(f"  Sweep failed for {asset}: {e}")
 
             await asyncio.sleep(API_DELAY)
+
+        # Now process USDT - distribute across ALL USDT-collateral positions
+        usdt_balance = balances.get('USDT', 0)
+        usdt_available = max(0, usdt_balance - MIN_RESERVE_USD)
+
+        if usdt_available >= 1 and 'USDT' in coll_to_positions:
+            usdt_positions = coll_to_positions['USDT']
+            num_positions = len(usdt_positions)
+            usdt_per_position = usdt_available / num_positions
+
+            logger.info(f"Sweep: Distributing ${usdt_available:.2f} USDT across {num_positions} positions (${usdt_per_position:.2f} each)")
+
+            for loan in usdt_positions:
+                loan_coin = loan.get('loanCoin')
+                add_amount = usdt_per_position
+
+                if add_amount < 0.50:
+                    continue
+
+                logger.info(f"  Adding {add_amount:.2f} USDT to USDT->{loan_coin}")
+
+                try:
+                    await self.client.adjust_loan_ltv(
+                        loan_coin=loan_coin,
+                        collateral_coin='USDT',
+                        adjustment_amount=add_amount,
+                        direction='ADDITIONAL'
+                    )
+                    result['swept_usd'] += add_amount
+                    result['positions_swept'] += 1
+                    result['details'].append({
+                        'asset': 'USDT',
+                        'amount': add_amount,
+                        'usd': add_amount,
+                        'position': f"USDT->{loan_coin}"
+                    })
+                    logger.info(f"  Swept {add_amount:.2f} USDT to USDT->{loan_coin} successfully")
+                except Exception as e:
+                    logger.warning(f"  Sweep USDT to {loan_coin} failed: {e}")
+
+                await asyncio.sleep(API_DELAY)
 
         return result
 
