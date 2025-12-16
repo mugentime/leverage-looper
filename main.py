@@ -1,5 +1,6 @@
 """
 Leverage Looper - Maximizes leverage to 4x on all Binance flexible loan positions
+With P&L tracking to monitor profitability
 """
 import asyncio
 import os
@@ -14,10 +15,12 @@ load_dotenv()
 
 from src.binance_client import BinanceClient
 from src.leverage_looper import LeverageLooper
+from src.profit_tracker import ProfitTracker
 
 # Global state
 client: BinanceClient = None
 leverage_looper: LeverageLooper = None
+profit_tracker: ProfitTracker = None
 check_count = 0
 last_result = {}
 
@@ -25,13 +28,21 @@ last_result = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize on startup, cleanup on shutdown"""
-    global client, leverage_looper
+    global client, leverage_looper, profit_tracker
 
     logger.info("Starting Leverage Looper...")
 
     client = BinanceClient()
     await client.initialize()
     leverage_looper = LeverageLooper(client)
+    profit_tracker = ProfitTracker(client)
+
+    # Record initial P&L snapshot
+    try:
+        initial_snapshot = await profit_tracker.record_snapshot()
+        logger.info(f"Initial equity: ${initial_snapshot['total_equity_usd']:.2f}")
+    except Exception as e:
+        logger.error(f"Failed to record initial snapshot: {e}")
 
     # Start background monitoring
     task = asyncio.create_task(monitoring_loop())
@@ -55,9 +66,20 @@ async def monitoring_loop():
             check_count += 1
             logger.info(f"=== Loop Check #{check_count} ===")
 
-            # Run leverage loops to maximize leverage to 4x
+            # Run leverage loops to maximize leverage
             last_result = await leverage_looper.loop_all_positions()
             logger.info(f"Result: {last_result.get('positions_looped', 0)} positions looped, {last_result.get('total_loops', 0)} total loops")
+
+            # Record P&L snapshot
+            try:
+                snapshot = await profit_tracker.record_snapshot()
+                pnl = snapshot['pnl_absolute_usd']
+                pnl_pct = snapshot['pnl_percent']
+                equity = snapshot['total_equity_usd']
+                sign = '+' if pnl >= 0 else ''
+                logger.info(f"P&L: {sign}${pnl:.2f} ({sign}{pnl_pct:.2f}%) | Equity: ${equity:.2f}")
+            except Exception as e:
+                logger.warning(f"Failed to record P&L snapshot: {e}")
 
         except Exception as e:
             logger.error(f"Monitoring error: {e}")
@@ -109,6 +131,80 @@ async def trigger_loop():
     try:
         last_result = await leverage_looper.loop_all_positions()
         return JSONResponse({"success": True, "result": last_result})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/pnl")
+async def get_pnl():
+    """Get current P&L summary - ARE YOU MAKING MONEY?"""
+    try:
+        # Get fresh snapshot
+        snapshot = await profit_tracker.record_snapshot()
+        summary = profit_tracker.get_pnl_summary()
+
+        pnl = snapshot['pnl_absolute_usd']
+        pnl_pct = snapshot['pnl_percent']
+
+        # Determine status
+        if pnl > 0:
+            status = "PROFIT"
+            emoji = "profit"
+        elif pnl < 0:
+            status = "LOSS"
+            emoji = "loss"
+        else:
+            status = "BREAKEVEN"
+            emoji = "neutral"
+
+        return JSONResponse({
+            "status": status,
+            "making_money": pnl > 0,
+            "pnl_absolute_usd": round(pnl, 2),
+            "pnl_percent": round(pnl_pct, 4),
+            "current_equity_usd": round(snapshot['total_equity_usd'], 2),
+            "starting_equity_usd": round(snapshot['starting_equity_usd'], 2),
+            "starting_timestamp": snapshot['starting_timestamp'],
+            "total_collateral_usd": round(snapshot['total_collateral_usd'], 2),
+            "total_debt_usd": round(snapshot['total_debt_usd'], 2),
+            "spot_value_usd": round(snapshot['spot_value_usd'], 2),
+            "high_equity_usd": round(summary['high_equity'], 2) if summary['high_equity'] else None,
+            "low_equity_usd": round(summary['low_equity'], 2) if summary['low_equity'] else None,
+            "trend": summary['trend'],
+            "snapshots_recorded": summary['snapshots_count'],
+            "positions": snapshot['positions'],
+            "timestamp": snapshot['timestamp']
+        })
+    except Exception as e:
+        logger.error(f"P&L error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/pnl/history")
+async def get_pnl_history(limit: int = 100):
+    """Get historical P&L snapshots"""
+    try:
+        history = profit_tracker.get_history(limit)
+        summary = profit_tracker.get_pnl_summary()
+        return JSONResponse({
+            "summary": summary,
+            "history": history
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/pnl/reset")
+async def reset_pnl():
+    """Reset P&L tracking (start fresh from current equity)"""
+    try:
+        profit_tracker.reset_tracking()
+        snapshot = await profit_tracker.record_snapshot()
+        return JSONResponse({
+            "success": True,
+            "message": "P&L tracking reset",
+            "new_starting_equity": round(snapshot['total_equity_usd'], 2)
+        })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
