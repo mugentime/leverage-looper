@@ -323,6 +323,50 @@ class BinanceClient:
         logger.info(f"Redeemed Simple Earn product {product_id}")
         return result
 
+    # ==================== LOAN HISTORY METHODS ====================
+
+    async def get_flexible_loan_borrow_history(self, days: int = 90) -> List[Dict]:
+        """Get flexible loan borrow history"""
+        from datetime import datetime, timedelta
+        end_time = int(datetime.now().timestamp() * 1000)
+        start_time = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+
+        params = {
+            'startTime': start_time,
+            'endTime': end_time,
+            'limit': 100
+        }
+        result = await self._request('GET', '/sapi/v2/loan/flexible/borrow/history', params)
+        return result.get('rows', [])
+
+    async def get_ltv_adjustment_history(self, days: int = 90) -> List[Dict]:
+        """Get LTV adjustment history (collateral additions/removals)"""
+        from datetime import datetime, timedelta
+        end_time = int(datetime.now().timestamp() * 1000)
+        start_time = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+
+        params = {
+            'startTime': start_time,
+            'endTime': end_time,
+            'limit': 100
+        }
+        result = await self._request('GET', '/sapi/v2/loan/flexible/ltv/adjustment/history', params)
+        return result.get('rows', [])
+
+    async def get_deposit_history(self, days: int = 90) -> List[Dict]:
+        """Get deposit history to Binance"""
+        from datetime import datetime, timedelta
+        end_time = int(datetime.now().timestamp() * 1000)
+        start_time = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+
+        params = {
+            'startTime': start_time,
+            'endTime': end_time,
+            'status': 1  # Success only
+        }
+        result = await self._request('GET', '/sapi/v1/capital/deposit/hisrec', params)
+        return result if isinstance(result, list) else []
+
     # ==================== PRICE DATA (via python-binance) ====================
 
     async def get_price(self, symbol: str) -> float:

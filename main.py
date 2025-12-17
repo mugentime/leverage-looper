@@ -209,6 +209,107 @@ async def reset_pnl():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.get("/pnl/real")
+async def get_real_pnl():
+    """
+    Get REAL P&L by querying Binance transaction history.
+    Calculates: Current Equity - Initial Collateral Deposited = P&L
+    """
+    try:
+        # Get current equity
+        snapshot = await profit_tracker.calculate_total_equity()
+        current_equity = snapshot['total_equity_usd']
+
+        # Get borrow history to find initial collateral deposits
+        borrow_history = await client.get_flexible_loan_borrow_history(days=90)
+
+        total_initial_collateral = 0.0
+        borrow_records = []
+
+        for record in borrow_history:
+            coll_coin = record.get('collateralCoin', '')
+            coll_amount = float(record.get('initialCollateralAmount', 0))
+            loan_coin = record.get('loanCoin', '')
+            loan_amount = float(record.get('initialLoanAmount', 0))
+            timestamp = int(record.get('borrowTime', 0))
+
+            # Get current price
+            if coll_coin == 'USDT':
+                price = 1.0
+            else:
+                try:
+                    price = await client.get_price(f'{coll_coin}USDT')
+                except:
+                    price = 0
+
+            usd_value = coll_amount * price
+            total_initial_collateral += usd_value
+
+            borrow_records.append({
+                'timestamp': timestamp,
+                'collateral_coin': coll_coin,
+                'collateral_amount': coll_amount,
+                'collateral_usd': round(usd_value, 2),
+                'loan_coin': loan_coin,
+                'loan_amount': loan_amount
+            })
+
+        # Get LTV adjustments (bot's additions from borrowed funds)
+        ltv_history = await client.get_ltv_adjustment_history(days=90)
+
+        total_bot_additions = 0.0
+        for record in ltv_history:
+            if record.get('direction') != 'ADDITIONAL':
+                continue
+            coll_coin = record.get('collateralCoin', '')
+            amount = float(record.get('adjustmentAmount', 0))
+
+            if coll_coin == 'USDT':
+                price = 1.0
+            else:
+                try:
+                    price = await client.get_price(f'{coll_coin}USDT')
+                except:
+                    price = 0
+
+            total_bot_additions += amount * price
+
+        # Calculate P&L
+        pnl = current_equity - total_initial_collateral
+        pnl_percent = (pnl / total_initial_collateral * 100) if total_initial_collateral > 0 else 0
+
+        if pnl > 0:
+            status = "PROFIT"
+            making_money = True
+        elif pnl < 0:
+            status = "LOSS"
+            making_money = False
+        else:
+            status = "BREAKEVEN"
+            making_money = False
+
+        return JSONResponse({
+            "status": status,
+            "making_money": making_money,
+            "pnl_usd": round(pnl, 2),
+            "pnl_percent": round(pnl_percent, 4),
+            "current_equity_usd": round(current_equity, 2),
+            "initial_collateral_usd": round(total_initial_collateral, 2),
+            "bot_additions_usd": round(total_bot_additions, 2),
+            "total_collateral_usd": round(snapshot['total_collateral_usd'], 2),
+            "total_debt_usd": round(snapshot['total_debt_usd'], 2),
+            "spot_value_usd": round(snapshot['spot_value_usd'], 2),
+            "borrow_records": borrow_records,
+            "positions_count": len(snapshot['positions']),
+            "calculation": "P&L = Current Equity - Initial Collateral Deposited",
+            "note": "Bot additions come from borrowed funds, not new deposits"
+        })
+    except Exception as e:
+        logger.error(f"Real P&L error: {e}")
+        import traceback
+        return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8003"))

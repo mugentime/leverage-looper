@@ -1,0 +1,5 @@
+nul
+.claude-flow/
+.swarm/
+__pycache__/
+data/
